@@ -52,10 +52,6 @@ pub fn main() !void {
         \\
     );
 
-    var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
-    var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
-    var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
-
     var iterable_dir = try std.fs.openIterableDirAbsolute(args[1], .{});
     defer iterable_dir.close();
 
@@ -64,10 +60,6 @@ pub fn main() !void {
 
     while (try walker.next()) |entry| {
         defer {
-            nodes.items.len = 0;
-            in_cluster.items.len = 0;
-            cross_cluster.items.len = 0;
-
             server.maybeFreeArena();
         }
 
@@ -83,7 +75,7 @@ pub fn main() !void {
         // NOTE: This function takes ownership of the input `text`
         var handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
 
-        try emit(server, zls_uri, entry.path, handle, &nodes, &in_cluster, &cross_cluster, w);
+        try emit(server, zls_uri, handle, w);
     }
 
     try w.writeAll("}");
@@ -92,40 +84,38 @@ pub fn main() !void {
 fn emit(
     server: *zls.Server,
     zls_uri: []const u8,
-    path: []const u8,
     handle: *const zls.DocumentStore.Handle,
-    nodes: *std.ArrayListUnmanaged(CallgraphEntry.Node),
-    in_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
-    cross_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
     writer: anytype,
 ) !void {
     var ctx = CallgraphContext{
-        .zls_uri_ = zls_uri,
+        .zls_uri = zls_uri,
         .server = server,
         .handle = handle,
         .writer = writer,
-
-        .nodes = nodes,
-        .in_cluster = in_cluster,
-        .cross_cluster = cross_cluster,
     };
+    try ctx.init();
     try zls.ast.iterateChildrenRecursive(handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
 
-    try writer.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(handle.uri)});
+    try writeCluster(ctx, 0, writer);
+    for (ctx.connections.items) |o| {
+        try writer.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+    }
+}
 
-    try writer.print("label=\"{}\";\n", .{std.zig.fmtEscapes(path)});
+fn writeCluster(ctx: CallgraphContext, cluster_idx: usize, writer: anytype) !void {
+    const cluster = ctx.clusters.items[cluster_idx];
 
-    for (nodes.items) |o| {
+    try writer.print("subgraph \"cluster_{x}\" {{\n", .{cluster.hash});
+
+    for (cluster.subclusters.items) |s| {
+        try writeCluster(ctx, s, writer);
+    }
+
+    for (cluster.nodes.items) |o| {
         try writer.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
     }
-    for (in_cluster.items) |o| {
-        try writer.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
-    }
-    try writer.writeAll("}\n");
 
-    for (cross_cluster.items) |o| {
-        try writer.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
-    }
+    try writer.writeAll("}\n");
 }
 
 const CallgraphEntry = struct {
@@ -139,17 +129,90 @@ const CallgraphEntry = struct {
 };
 
 const CallgraphContext = struct {
-    zls_uri_: []const u8,
+    const Scope = struct {
+        const Kind = enum {
+            func,
+            container,
+        };
+
+        node: Ast.Node.Index,
+        loc: zls.offsets.Loc,
+
+        kind: Kind,
+        cluster: usize = 0,
+    };
+
+    const Cluster = struct {
+        hash: u64,
+        label: []const u8,
+
+        nodes: std.ArrayListUnmanaged(CallgraphEntry.Node) = .{},
+        subclusters: std.ArrayListUnmanaged(usize) = .{},
+    };
+
+    zls_uri: []const u8,
     server: *zls.Server,
     handle: *const zls.DocumentStore.Handle,
     writer: std.fs.File.Writer,
 
-    nodes: *std.ArrayListUnmanaged(CallgraphEntry.Node),
+    clusters: std.ArrayListUnmanaged(Cluster) = .{},
+    connections: std.ArrayListUnmanaged(CallgraphEntry) = .{},
+    scope_stack: std.BoundedArray(Scope, 128) = .{},
 
-    in_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
-    cross_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
+    fn init(ctx: *@This()) !void {
+        try ctx.clusters.append(ctx.server.arena.allocator(), .{ .hash = std.hash_map.hashString(ctx.handle.uri) });
+        try ctx.scope_stack.append(.{
+            .node = 0,
+            .loc = .{
+                .start = 0,
+                .end = ctx.handle.text.len,
+            },
 
-    func_stack: std.BoundedArray(struct { node: Ast.Node.Index, loc: zls.offsets.Loc }, 16) = .{},
+            .kind = .container,
+            .cluster = 0,
+        });
+    }
+
+    fn currentScope(ctx: *@This()) ?Scope {
+        return if (ctx.scope_stack.len != 0)
+            ctx.scope_stack.buffer[ctx.scope_stack.len - 1]
+        else
+            null;
+    }
+
+    fn currentContainer(ctx: *@This()) ?Scope {
+        var it = std.mem.reverseIterator(ctx.scope_stack.constSlice());
+        while (it.next()) |scope| {
+            if (scope.kind == .container) return scope;
+        }
+        return null;
+    }
+
+    fn currentFunction(ctx: *@This()) ?Scope {
+        var it = std.mem.reverseIterator(ctx.scope_stack.constSlice());
+        while (it.next()) |scope| {
+            if (scope.kind == .func) return scope;
+        }
+        return null;
+    }
+
+    fn maybeInvalidateScope(ctx: *@This(), current_node: Ast.Node.Index) void {
+        var curr = ctx.currentScope();
+        if (curr) |cf| {
+            if (zls.offsets.nodeToLoc(ctx.handle.tree, current_node).start >= cf.loc.end) {
+                // std.log.info("Leaving function {s}", .{zls.analysis.getDeclName(ctx.handle.tree, cf.node).?});
+                _ = ctx.scope_stack.pop();
+            }
+        }
+    }
+
+    fn currentFunctionId(ctx: *@This()) ![]const u8 {
+        return std.fmt.allocPrint(ctx.server.arena.allocator(), "{s}#{d}", .{ ctx.handle.uri, ctx.currentFunction().?.node });
+    }
+
+    fn currentFunctionName(ctx: *@This()) []const u8 {
+        return zls.analysis.getDeclName(ctx.handle.tree, ctx.currentFunction().?.node).?;
+    }
 
     fn callback(ctx: *@This(), tree: Ast, node: Ast.Node.Index) anyerror!void {
         _ = .{ ctx, tree, node };
@@ -157,34 +220,65 @@ const CallgraphContext = struct {
         const arena = ctx.server.arena.allocator();
         const handle = ctx.handle;
 
-        var current_func = if (ctx.func_stack.len != 0) ctx.func_stack.buffer[ctx.func_stack.len - 1] else null;
-        if (current_func) |cf| {
-            if (zls.offsets.nodeToLoc(tree, node).start >= cf.loc.end) {
-                // std.log.info("Leaving function {s}", .{zls.analysis.getDeclName(tree, cf.node).?});
-                _ = ctx.func_stack.pop();
-            }
-        }
+        ctx.maybeInvalidateScope(node);
 
         const tags = tree.nodes.items(.tag);
         switch (tags[node]) {
+            .local_var_decl,
+            .global_var_decl,
+            .simple_var_decl,
+            .aligned_var_decl,
+            => {
+                const full = tree.fullVarDecl(node).?;
+
+                if (full.ast.init_node == 0) return;
+                const subnode = full.ast.init_node;
+
+                switch (tags[subnode]) {
+                    .container_decl,
+                    .container_decl_trailing,
+                    .container_decl_arg,
+                    .container_decl_arg_trailing,
+                    .container_decl_two,
+                    .container_decl_two_trailing,
+                    .tagged_union,
+                    .tagged_union_trailing,
+                    .tagged_union_two,
+                    .tagged_union_two_trailing,
+                    .tagged_union_enum_tag,
+                    .tagged_union_enum_tag_trailing,
+                    => {
+                        var hasher = std.hash.Wyhash.init(0);
+
+                        hasher.update(ctx.handle.uri);
+                        hasher.update(&std.mem.toBytes(node));
+
+                        try ctx.clusters.append(arena, .{
+                            .hash = hasher.final(),
+                        });
+
+                        try ctx.clusters.items[ctx.currentContainer().?.cluster].subclusters.append(arena, ctx.clusters.items.len - 1);
+
+                        try ctx.scope_stack.append(.{
+                            .node = subnode,
+                            .loc = zls.offsets.nodeToLoc(tree, subnode),
+                            .kind = .container,
+                            .cluster = ctx.clusters.items.len - 1,
+                        });
+                    },
+                    else => {},
+                }
+            },
             .fn_decl => {
-                // std.log.info("Entering function {s}", .{zls.analysis.getDeclName(tree, node).?});
-                try ctx.func_stack.append(.{
+                try ctx.scope_stack.append(.{
                     .node = node,
                     .loc = zls.offsets.nodeToLoc(tree, node),
+                    .kind = .func,
                 });
 
-                current_func = ctx.func_stack.buffer[ctx.func_stack.len - 1];
-
-                const from_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
-                    handle.uri,
-                    zls.analysis.getDeclName(tree, current_func.?.node).?,
-                });
-                const from_label = zls.analysis.getDeclName(tree, current_func.?.node).?;
-
-                try ctx.nodes.append(ctx.server.allocator, .{
-                    .id = from_id,
-                    .label = from_label,
+                try ctx.clusters.items[ctx.currentContainer().?.cluster].nodes.append(arena, .{
+                    .id = try ctx.currentFunctionId(),
+                    .label = ctx.currentFunctionName(),
                 });
             },
             .call,
@@ -208,34 +302,31 @@ const CallgraphContext = struct {
 
                         for (accesses) |decl_handle| {
                             var new_handle: *const zls.DocumentStore.Handle = decl_handle.handle;
-                            const name_token = switch (decl_handle.decl.*) {
+                            const decl_node = switch (decl_handle.decl.*) {
                                 .ast_node => |accessed_node| block: {
                                     if (try zls.analysis.resolveVarDeclAlias(ctx.server.arena.allocator(), &ctx.server.document_store, .{ .node = accessed_node, .handle = new_handle })) |result| {
                                         new_handle = result.handle;
 
-                                        break :block result.nameToken();
+                                        break :block result.decl.ast_node;
                                     }
 
-                                    break :block zls.analysis.getDeclNameToken(new_handle.tree, accessed_node) orelse continue;
+                                    break :block accessed_node;
                                 },
-                                else => decl_handle.nameToken(),
+                                else => continue,
                             };
 
-                            if (current_func != null and std.mem.startsWith(u8, new_handle.uri, ctx.zls_uri_)) {
-                                const from_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
-                                    handle.uri,
-                                    zls.analysis.getDeclName(tree, current_func.?.node).?,
-                                });
-                                const to_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
-                                    new_handle.uri,
-                                    new_handle.tree.tokenSlice(name_token),
-                                });
+                            if (ctx.currentScope() == null or ctx.currentScope().?.kind == .container or !std.mem.startsWith(u8, new_handle.uri, ctx.zls_uri))
+                                break;
 
-                                try (if (std.mem.eql(u8, handle.uri, new_handle.uri)) ctx.in_cluster else ctx.cross_cluster).append(ctx.server.allocator, .{
-                                    .from = from_id,
-                                    .to = to_id,
-                                });
-                            }
+                            const to_id = try std.fmt.allocPrint(arena, "{s}#{d}", .{
+                                new_handle.uri,
+                                decl_node,
+                            });
+
+                            try ctx.connections.append(arena, .{
+                                .from = try ctx.currentFunctionId(),
+                                .to = to_id,
+                            });
                         }
                     },
                     else => {},
