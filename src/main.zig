@@ -17,9 +17,9 @@ pub const std_options = struct {
     }
 };
 
-// TODO: Track functions that don't call any other in-scope functions (example sendInternal)
 // TODO: Multiple files
 // TODO: Make graphs actually usable
+// TODO: Subgraphs of structs/enums/unions/opaques
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -46,151 +46,170 @@ pub fn main() !void {
     // NOTE: This function takes ownership of the input `text`
     var main_handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
 
-    const CallgraphEntry = struct {
-        const Node = struct {
-            id: []const u8,
-            label: ?[]const u8 = null,
-        };
-
-        from: Node,
-        to: Node,
-        is_in_same_cluster: bool,
-    };
-
-    const CallgraphContext = struct {
-        zls_uri_: []const u8,
-        server_: *zls.Server,
-        handle: *const zls.DocumentStore.Handle,
-        writer: std.fs.File.Writer,
-
-        output: *std.ArrayListUnmanaged(CallgraphEntry),
-        func_stack: std.BoundedArray(struct { node: Ast.Node.Index, loc: zls.offsets.Loc }, 16) = .{},
-
-        fn callback(ctx: *@This(), tree: Ast, node: Ast.Node.Index) anyerror!void {
-            _ = .{ ctx, tree, node };
-
-            const arena = ctx.server_.arena.allocator();
-            const handle = ctx.handle;
-
-            const current_func = if (ctx.func_stack.len != 0) ctx.func_stack.buffer[ctx.func_stack.len - 1] else null;
-            if (current_func) |cf| {
-                if (zls.offsets.nodeToLoc(tree, node).start >= cf.loc.end) {
-                    // std.log.info("Leaving function {s}", .{zls.analysis.getDeclName(tree, cf.node).?});
-                    _ = ctx.func_stack.pop();
-                }
-            }
-
-            const tags = tree.nodes.items(.tag);
-            switch (tags[node]) {
-                .fn_decl => {
-                    // std.log.info("Entering function {s}", .{zls.analysis.getDeclName(tree, node).?});
-                    try ctx.func_stack.append(.{
-                        .node = node,
-                        .loc = zls.offsets.nodeToLoc(tree, node),
-                    });
-                },
-                .call,
-                .call_comma,
-                .async_call,
-                .async_call_comma,
-                .call_one,
-                .call_one_comma,
-                .async_call_one,
-                .async_call_one_comma,
-                => {
-                    var nodes: [1]Ast.Node.Index = undefined;
-                    const full = tree.fullCall(&nodes, node) orelse unreachable;
-
-                    const source_index = tree.tokens.items(.start)[tree.lastToken(full.ast.fn_expr)];
-                    const pos_context = try zls.analysis.getPositionContext(ctx.server_.arena.allocator(), handle.text, source_index, true);
-
-                    switch (pos_context) {
-                        .field_access => |loc| {
-                            const accesses = try ctx.server_.getSymbolFieldAccesses(handle, source_index, loc) orelse return;
-
-                            for (accesses) |decl_handle| {
-                                var new_handle: *const zls.DocumentStore.Handle = decl_handle.handle;
-                                const name_token = switch (decl_handle.decl.*) {
-                                    .ast_node => |accessed_node| block: {
-                                        if (try zls.analysis.resolveVarDeclAlias(ctx.server_.arena.allocator(), &ctx.server_.document_store, .{ .node = accessed_node, .handle = new_handle })) |result| {
-                                            new_handle = result.handle;
-
-                                            break :block result.nameToken();
-                                        }
-
-                                        break :block zls.analysis.getDeclNameToken(new_handle.tree, accessed_node) orelse continue;
-                                    },
-                                    else => decl_handle.nameToken(),
-                                };
-
-                                if (current_func != null and std.mem.startsWith(u8, new_handle.uri, ctx.zls_uri_)) {
-                                    try ctx.output.append(arena, .{
-                                        .from = .{
-                                            .id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
-                                                handle.uri,
-                                                zls.analysis.getDeclName(tree, current_func.?.node).?,
-                                            }),
-                                            .label = zls.analysis.getDeclName(tree, current_func.?.node).?,
-                                        },
-                                        .to = .{
-                                            .id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
-                                                new_handle.uri,
-                                                new_handle.tree.tokenSlice(name_token),
-                                            }),
-                                        },
-                                        .is_in_same_cluster = std.mem.eql(u8, handle.uri, new_handle.uri),
-                                    });
-                                    // try ctx.writer.print("\"{}__{}\" [label=\"{}\"];\n", .{
-                                    //     std.zig.fmtEscapes(handle.uri),
-                                    //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                    //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                    // });
-                                    // try ctx.writer.print("\"{}__{}\" -> \"{}__{}\";\n", .{
-                                    //     std.zig.fmtEscapes(handle.uri),
-                                    //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                    //     std.zig.fmtEscapes(new_handle.uri),
-                                    //     std.zig.fmtEscapes(new_handle.tree.tokenSlice(name_token)),
-                                    // });
-                                    // std.log.info("{s} {s}", .{ new_handle.uri, new_handle.tree.tokenSlice(name_token) });
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
-            }
-        }
-    };
-
     var w = std.io.getStdOut().writer();
     try w.writeAll("digraph zls {\n");
 
-    var outp = std.ArrayListUnmanaged(CallgraphEntry){};
+    var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
+    var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+    var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
 
     var ctx = CallgraphContext{
         .zls_uri_ = zls_uri,
-        .server_ = server,
+        .server = server,
         .handle = main_handle,
         .writer = w,
-        .output = &outp,
+
+        .nodes = &nodes,
+        .in_cluster = &in_cluster,
+        .cross_cluster = &cross_cluster,
     };
     try zls.ast.iterateChildrenRecursive(main_handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
 
-    try w.print("subgraph cluster_abc {{\n", .{});
-    for (outp.items) |o| {
-        try w.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.from.id), std.zig.fmtEscapes(o.from.label.?) });
-        if (o.is_in_same_cluster) {
-            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from.id), std.zig.fmtEscapes(o.to.id) });
-        }
+    try w.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(main_handle.uri)});
+
+    try w.print("label=\"{}\";\n", .{std.zig.fmtEscapes(main_handle.uri)});
+
+    for (nodes.items) |o| {
+        try w.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
+    }
+    for (in_cluster.items) |o| {
+        try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
     }
     try w.writeAll("}");
 
-    for (outp.items) |o| {
-        if (!o.is_in_same_cluster) {
-            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from.id), std.zig.fmtEscapes(o.to.id) });
-        }
+    for (cross_cluster.items) |o| {
+        try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
     }
 
     try w.writeAll("}");
 }
+
+const CallgraphEntry = struct {
+    const Node = struct {
+        id: []const u8,
+        label: []const u8,
+    };
+
+    from: []const u8,
+    to: []const u8,
+};
+
+const CallgraphContext = struct {
+    zls_uri_: []const u8,
+    server: *zls.Server,
+    handle: *const zls.DocumentStore.Handle,
+    writer: std.fs.File.Writer,
+
+    nodes: *std.ArrayListUnmanaged(CallgraphEntry.Node),
+
+    in_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
+    cross_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
+
+    func_stack: std.BoundedArray(struct { node: Ast.Node.Index, loc: zls.offsets.Loc }, 16) = .{},
+
+    fn callback(ctx: *@This(), tree: Ast, node: Ast.Node.Index) anyerror!void {
+        _ = .{ ctx, tree, node };
+
+        const arena = ctx.server.arena.allocator();
+        const handle = ctx.handle;
+
+        var current_func = if (ctx.func_stack.len != 0) ctx.func_stack.buffer[ctx.func_stack.len - 1] else null;
+        if (current_func) |cf| {
+            if (zls.offsets.nodeToLoc(tree, node).start >= cf.loc.end) {
+                // std.log.info("Leaving function {s}", .{zls.analysis.getDeclName(tree, cf.node).?});
+                _ = ctx.func_stack.pop();
+            }
+        }
+
+        const tags = tree.nodes.items(.tag);
+        switch (tags[node]) {
+            .fn_decl => {
+                // std.log.info("Entering function {s}", .{zls.analysis.getDeclName(tree, node).?});
+                try ctx.func_stack.append(.{
+                    .node = node,
+                    .loc = zls.offsets.nodeToLoc(tree, node),
+                });
+
+                current_func = ctx.func_stack.buffer[ctx.func_stack.len - 1];
+
+                const from_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
+                    handle.uri,
+                    zls.analysis.getDeclName(tree, current_func.?.node).?,
+                });
+                const from_label = zls.analysis.getDeclName(tree, current_func.?.node).?;
+
+                try ctx.nodes.append(ctx.server.allocator, .{
+                    .id = from_id,
+                    .label = from_label,
+                });
+            },
+            .call,
+            .call_comma,
+            .async_call,
+            .async_call_comma,
+            .call_one,
+            .call_one_comma,
+            .async_call_one,
+            .async_call_one_comma,
+            => {
+                var nodes: [1]Ast.Node.Index = undefined;
+                const full = tree.fullCall(&nodes, node) orelse unreachable;
+
+                const source_index = tree.tokens.items(.start)[tree.lastToken(full.ast.fn_expr)];
+                const pos_context = try zls.analysis.getPositionContext(ctx.server.arena.allocator(), handle.text, source_index, true);
+
+                switch (pos_context) {
+                    .field_access => |loc| {
+                        const accesses = try ctx.server.getSymbolFieldAccesses(handle, source_index, loc) orelse return;
+
+                        for (accesses) |decl_handle| {
+                            var new_handle: *const zls.DocumentStore.Handle = decl_handle.handle;
+                            const name_token = switch (decl_handle.decl.*) {
+                                .ast_node => |accessed_node| block: {
+                                    if (try zls.analysis.resolveVarDeclAlias(ctx.server.arena.allocator(), &ctx.server.document_store, .{ .node = accessed_node, .handle = new_handle })) |result| {
+                                        new_handle = result.handle;
+
+                                        break :block result.nameToken();
+                                    }
+
+                                    break :block zls.analysis.getDeclNameToken(new_handle.tree, accessed_node) orelse continue;
+                                },
+                                else => decl_handle.nameToken(),
+                            };
+
+                            if (current_func != null and std.mem.startsWith(u8, new_handle.uri, ctx.zls_uri_)) {
+                                const from_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
+                                    handle.uri,
+                                    zls.analysis.getDeclName(tree, current_func.?.node).?,
+                                });
+                                const to_id = try std.fmt.allocPrint(arena, "{s}#{s}", .{
+                                    new_handle.uri,
+                                    new_handle.tree.tokenSlice(name_token),
+                                });
+
+                                try (if (std.mem.eql(u8, handle.uri, new_handle.uri)) ctx.in_cluster else ctx.cross_cluster).append(ctx.server.allocator, .{
+                                    .from = from_id,
+                                    .to = to_id,
+                                });
+                                // try ctx.writer.print("\"{}__{}\" [label=\"{}\"];\n", .{
+                                //     std.zig.fmtEscapes(handle.uri),
+                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
+                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
+                                // });
+                                // try ctx.writer.print("\"{}__{}\" -> \"{}__{}\";\n", .{
+                                //     std.zig.fmtEscapes(handle.uri),
+                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
+                                //     std.zig.fmtEscapes(new_handle.uri),
+                                //     std.zig.fmtEscapes(new_handle.tree.tokenSlice(name_token)),
+                                // });
+                                // std.log.info("{s} {s}", .{ new_handle.uri, new_handle.tree.tokenSlice(name_token) });
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+};
