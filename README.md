@@ -6,6 +6,13 @@ Use zls as a library to map Zig projects using Graphviz!
 
 Extra WIP, please don't use this right now
 
+## How-to
+
+```
+zig build run -- /path/to/project/build.zig > project.dot
+fdp project.dot -Tsvg -o project.svg
+```
+
 ## License
 
 MIT

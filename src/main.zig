@@ -52,6 +52,10 @@ pub fn main() !void {
         \\
     );
 
+    var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
+    var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+    var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+
     var iterable_dir = try std.fs.openIterableDirAbsolute(args[1], .{});
     defer iterable_dir.close();
 
@@ -59,6 +63,14 @@ pub fn main() !void {
     defer walker.deinit();
 
     while (try walker.next()) |entry| {
+        defer {
+            nodes.items.len = 0;
+            in_cluster.items.len = 0;
+            cross_cluster.items.len = 0;
+
+            server.maybeFreeArena();
+        }
+
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
         if (std.mem.indexOf(u8, entry.path, "zig-cache") != null or std.mem.indexOf(u8, entry.path, "zig-out") != null) continue;
 
@@ -69,42 +81,51 @@ pub fn main() !void {
         std.log.info("Graphing {s}", .{main_uri});
 
         // NOTE: This function takes ownership of the input `text`
-        var main_handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
+        var handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
 
-        var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
-        var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
-        var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
-
-        var ctx = CallgraphContext{
-            .zls_uri_ = zls_uri,
-            .server = server,
-            .handle = main_handle,
-            .writer = w,
-
-            .nodes = &nodes,
-            .in_cluster = &in_cluster,
-            .cross_cluster = &cross_cluster,
-        };
-        try zls.ast.iterateChildrenRecursive(main_handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
-
-        try w.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(main_handle.uri)});
-
-        try w.print("label=\"{}\";\n", .{std.zig.fmtEscapes(entry.path)});
-
-        for (nodes.items) |o| {
-            try w.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
-        }
-        for (in_cluster.items) |o| {
-            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
-        }
-        try w.writeAll("}\n");
-
-        for (cross_cluster.items) |o| {
-            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
-        }
+        try emit(server, zls_uri, entry.path, handle, &nodes, &in_cluster, &cross_cluster, w);
     }
 
     try w.writeAll("}");
+}
+
+fn emit(
+    server: *zls.Server,
+    zls_uri: []const u8,
+    path: []const u8,
+    handle: *const zls.DocumentStore.Handle,
+    nodes: *std.ArrayListUnmanaged(CallgraphEntry.Node),
+    in_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
+    cross_cluster: *std.ArrayListUnmanaged(CallgraphEntry),
+    writer: anytype,
+) !void {
+    var ctx = CallgraphContext{
+        .zls_uri_ = zls_uri,
+        .server = server,
+        .handle = handle,
+        .writer = writer,
+
+        .nodes = nodes,
+        .in_cluster = in_cluster,
+        .cross_cluster = cross_cluster,
+    };
+    try zls.ast.iterateChildrenRecursive(handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
+
+    try writer.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(handle.uri)});
+
+    try writer.print("label=\"{}\";\n", .{std.zig.fmtEscapes(path)});
+
+    for (nodes.items) |o| {
+        try writer.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
+    }
+    for (in_cluster.items) |o| {
+        try writer.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+    }
+    try writer.writeAll("}\n");
+
+    for (cross_cluster.items) |o| {
+        try writer.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+    }
 }
 
 const CallgraphEntry = struct {
