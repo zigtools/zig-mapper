@@ -42,43 +42,59 @@ pub fn main() !void {
     server.offset_encoding = .@"utf-8";
     defer server.destroy();
 
-    const main_uri = try zls.URI.pathRelative(allocator, zls_uri, "src/Server.zig");
-    // NOTE: This function takes ownership of the input `text`
-    var main_handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
-
     var w = std.io.getStdOut().writer();
     try w.writeAll("digraph zls {\n");
 
-    var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
-    var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
-    var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+    var iterable_dir = try std.fs.openIterableDirAbsolute(args[1], .{});
+    defer iterable_dir.close();
 
-    var ctx = CallgraphContext{
-        .zls_uri_ = zls_uri,
-        .server = server,
-        .handle = main_handle,
-        .writer = w,
+    var walker = try iterable_dir.walk(allocator);
+    defer walker.deinit();
 
-        .nodes = &nodes,
-        .in_cluster = &in_cluster,
-        .cross_cluster = &cross_cluster,
-    };
-    try zls.ast.iterateChildrenRecursive(main_handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
+    while (try walker.next()) |entry| {
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.indexOf(u8, entry.path, "zig-cache") != null or std.mem.indexOf(u8, entry.path, "zig-out") != null) continue;
 
-    try w.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(main_handle.uri)});
+        const main_path = try std.fs.path.join(allocator, &.{ args[1], entry.path });
+        const main_uri = try zls.URI.fromPath(allocator, main_path);
+        allocator.free(main_path);
 
-    try w.print("label=\"{}\";\n", .{std.zig.fmtEscapes(main_handle.uri)});
+        std.log.info("Graphing {s}", .{main_uri});
 
-    for (nodes.items) |o| {
-        try w.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
-    }
-    for (in_cluster.items) |o| {
-        try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
-    }
-    try w.writeAll("}");
+        // NOTE: This function takes ownership of the input `text`
+        var main_handle = (server.document_store.getOrLoadHandle(main_uri)) orelse @panic("Main file does not exist");
 
-    for (cross_cluster.items) |o| {
-        try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+        var nodes = std.ArrayListUnmanaged(CallgraphEntry.Node){};
+        var in_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+        var cross_cluster = std.ArrayListUnmanaged(CallgraphEntry){};
+
+        var ctx = CallgraphContext{
+            .zls_uri_ = zls_uri,
+            .server = server,
+            .handle = main_handle,
+            .writer = w,
+
+            .nodes = &nodes,
+            .in_cluster = &in_cluster,
+            .cross_cluster = &cross_cluster,
+        };
+        try zls.ast.iterateChildrenRecursive(main_handle.tree, 0, &ctx, anyerror, CallgraphContext.callback);
+
+        try w.print("subgraph \"cluster_{}\" {{\n", .{std.zig.fmtEscapes(main_handle.uri)});
+
+        try w.print("label=\"{}\";\n", .{std.zig.fmtEscapes(entry.path)});
+
+        for (nodes.items) |o| {
+            try w.print("\"{}\" [label=\"{}\"];\n", .{ std.zig.fmtEscapes(o.id), std.zig.fmtEscapes(o.label) });
+        }
+        for (in_cluster.items) |o| {
+            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+        }
+        try w.writeAll("}\n");
+
+        for (cross_cluster.items) |o| {
+            try w.print("\"{}\" -> \"{}\";\n", .{ std.zig.fmtEscapes(o.from), std.zig.fmtEscapes(o.to) });
+        }
     }
 
     try w.writeAll("}");
@@ -191,18 +207,6 @@ const CallgraphContext = struct {
                                     .from = from_id,
                                     .to = to_id,
                                 });
-                                // try ctx.writer.print("\"{}__{}\" [label=\"{}\"];\n", .{
-                                //     std.zig.fmtEscapes(handle.uri),
-                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                // });
-                                // try ctx.writer.print("\"{}__{}\" -> \"{}__{}\";\n", .{
-                                //     std.zig.fmtEscapes(handle.uri),
-                                //     std.zig.fmtEscapes(zls.analysis.getDeclName(tree, current_func.?.node).?),
-                                //     std.zig.fmtEscapes(new_handle.uri),
-                                //     std.zig.fmtEscapes(new_handle.tree.tokenSlice(name_token)),
-                                // });
-                                // std.log.info("{s} {s}", .{ new_handle.uri, new_handle.tree.tokenSlice(name_token) });
                             }
                         }
                     },
