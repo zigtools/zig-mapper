@@ -17,7 +17,6 @@ pub const std_options = struct {
     }
 };
 
-// TODO: Multiple files
 // TODO: Make graphs actually usable
 // TODO: Subgraphs of structs/enums/unions/opaques
 
@@ -43,7 +42,15 @@ pub fn main() !void {
     defer server.destroy();
 
     var w = std.io.getStdOut().writer();
-    try w.writeAll("digraph zls {\n");
+    try w.writeAll(
+        \\strict digraph zls {
+        \\concentrate=true;
+        \\layout="fdp";
+        \\overlap = false;
+        \\splines = true;
+        \\node [shape="box"]
+        \\
+    );
 
     var iterable_dir = try std.fs.openIterableDirAbsolute(args[1], .{});
     defer iterable_dir.close();

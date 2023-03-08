@@ -1,3 +1,4 @@
 *.dot
+*.svg
 zig-cache
 zig-out
