@@ -1,0 +1,10 @@
+.{
+    .name = "zls-bts",
+    .version = "1.0.0",
+    .dependencies = .{
+        .zls = .{
+            .url = "https://github.com/zigtools/zls/archive/42a8d1adb7c412678bf368a7224797fa1758ed10.tar.gz",
+            .hash = "1220ac82524eea8b3c86bf90bfff7a54fc941466e536b4371370b6137a2f2b643a73",
+        },
+    },
+}

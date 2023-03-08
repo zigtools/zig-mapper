@@ -1,0 +1,3 @@
+*.dot
+zig-cache
+zig-out
