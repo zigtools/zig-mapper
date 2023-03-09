@@ -44,11 +44,10 @@ pub fn main() !void {
     var w = std.io.getStdOut().writer();
     try w.writeAll(
         \\strict digraph zls {
-        \\concentrate=true;
         \\layout="fdp";
-        \\overlap = false;
-        \\splines = true;
+        \\graph [splines=compound, concentrate=true, nodesep="1", ranksep="2"];
         \\node [shape="box"]
+        \\edge [len=1]
         \\
     );
 
@@ -102,10 +101,28 @@ fn emit(
     }
 }
 
+fn isDead(ctx: CallgraphContext, cluster_idx: usize) bool {
+    const cluster = ctx.clusters.items[cluster_idx];
+
+    if (cluster.nodes.items.len != 0)
+        return false;
+
+    for (cluster.subclusters.items) |sub| {
+        if (!isDead(ctx, sub)) return false;
+    }
+
+    return true;
+}
+
 fn writeCluster(ctx: CallgraphContext, cluster_idx: usize, writer: anytype) !void {
     const cluster = ctx.clusters.items[cluster_idx];
 
+    if (isDead(ctx, cluster_idx))
+        return;
+
     try writer.print("subgraph \"cluster_{x}\" {{\n", .{cluster.hash});
+    try writer.print("label=\"{}\";\n", .{std.zig.fmtEscapes(cluster.label)});
+    try writer.writeAll("margin=20;\n");
 
     for (cluster.subclusters.items) |s| {
         try writeCluster(ctx, s, writer);
@@ -160,7 +177,10 @@ const CallgraphContext = struct {
     scope_stack: std.BoundedArray(Scope, 128) = .{},
 
     fn init(ctx: *@This()) !void {
-        try ctx.clusters.append(ctx.server.arena.allocator(), .{ .hash = std.hash_map.hashString(ctx.handle.uri) });
+        try ctx.clusters.append(ctx.server.arena.allocator(), .{
+            .hash = std.hash_map.hashString(ctx.handle.uri),
+            .label = ctx.handle.uri,
+        });
         try ctx.scope_stack.append(.{
             .node = 0,
             .loc = .{
@@ -197,12 +217,11 @@ const CallgraphContext = struct {
     }
 
     fn maybeInvalidateScope(ctx: *@This(), current_node: Ast.Node.Index) void {
-        var curr = ctx.currentScope();
-        if (curr) |cf| {
+        var it = std.mem.reverseIterator(ctx.scope_stack.constSlice());
+        while (it.next()) |cf| {
             if (zls.offsets.nodeToLoc(ctx.handle.tree, current_node).start >= cf.loc.end) {
-                // std.log.info("Leaving function {s}", .{zls.analysis.getDeclName(ctx.handle.tree, cf.node).?});
                 _ = ctx.scope_stack.pop();
-            }
+            } else break;
         }
     }
 
@@ -255,6 +274,7 @@ const CallgraphContext = struct {
 
                         try ctx.clusters.append(arena, .{
                             .hash = hasher.final(),
+                            .label = zls.analysis.getDeclName(tree, node).?,
                         });
 
                         try ctx.clusters.items[ctx.currentContainer().?.cluster].subclusters.append(arena, ctx.clusters.items.len - 1);

@@ -2,3 +2,4 @@
 *.svg
 zig-cache
 zig-out
+/output
